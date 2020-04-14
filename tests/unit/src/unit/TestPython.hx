@@ -67,7 +67,7 @@ import python.lib.json.JSONEncoder;
 
 private typedef T = {
 	var value:Int;
-	@:optional var maybeValue:Int;
+	var ?maybeValue:Int;
 }
 
 private enum MyEnum {
@@ -99,6 +99,7 @@ class TestPython extends Test {
 
 	public function testKeywords () {
 		var list = new Array();
+		noAssert();
 	}
 
 	public function testStringMethod() {
@@ -309,12 +310,13 @@ class TestPython extends Test {
 		catch (e:Dynamic) {
 			e = 1;
 		}
+		noAssert();
 	}
 
 	var _s:String;
 
 	var s(get, null):String;
-	var s2(null, set_s2):String;
+	var s2(null, set):String;
 	var s3(get, set):String;
 
 	function get_s() return s;
