@@ -8,6 +8,7 @@ type rename_init = {
 	mutable ri_scope : var_scope;
 	mutable ri_hoisting : bool;
 	mutable ri_no_shadowing : bool;
+	mutable ri_no_catch_var_shadowing : bool;
 	mutable ri_switch_cases_no_blocks : bool;
 	mutable ri_reserved : bool StringMap.t;
 	mutable ri_reserve_current_top_level_symbol : bool;
@@ -22,22 +23,26 @@ let reserve_init ri name =
 	ri.ri_reserved <- StringMap.add name true ri.ri_reserved
 
 (**
-	Make all class names reserved names.
-	No local variable will have a name matching a class.
+	Make all module-level names reserved.
+	No local variable will have a name matching a module-level declaration.
 *)
 let reserve_all_types ri com path_to_name =
 	List.iter (fun mt ->
 		let tinfos = t_infos mt in
 		let native_name = try fst (TypeloadCheck.get_native_name tinfos.mt_meta) with Not_found -> path_to_name tinfos.mt_path in
-		if native_name = "" then
-			match mt with
-			| TClassDecl c ->
-				List.iter (fun cf ->
-					let native_name = try fst (TypeloadCheck.get_native_name cf.cf_meta) with Not_found -> cf.cf_name in
-					reserve_init ri native_name
-				) c.cl_ordered_statics;
-			| _ -> ()
-		else
+		match mt with
+		| TClassDecl c when native_name = "" ->
+			List.iter (fun cf ->
+				let native_name = try fst (TypeloadCheck.get_native_name cf.cf_meta) with Not_found -> cf.cf_name in
+				reserve_init ri native_name
+			) c.cl_ordered_statics
+		| TClassDecl { cl_kind = KModuleFields m; cl_ordered_statics = fl } ->
+			let prefix = Path.flat_path m.m_path ^ "_" in
+			List.iter (fun cf ->
+				let name = try fst (TypeloadCheck.get_native_name cf.cf_meta) with Not_found -> prefix ^ cf.cf_name in
+				reserve_init ri name
+			) fl
+		| _ ->
 			reserve_init ri native_name
 	) com.types
 
@@ -50,6 +55,7 @@ let init com =
 		ri_reserved = StringMap.empty;
 		ri_hoisting = false;
 		ri_no_shadowing = false;
+		ri_no_catch_var_shadowing = false;
 		ri_switch_cases_no_blocks = false;
 		ri_reserve_current_top_level_symbol = false;
 	} in
@@ -60,6 +66,8 @@ let init com =
 			ri.ri_hoisting <- true;
 		| NoShadowing ->
 			ri.ri_no_shadowing <- true;
+		| NoCatchVarShadowing ->
+			ri.ri_no_catch_var_shadowing <- true;
 		| SwitchCasesNoBlocks ->
 			ri.ri_switch_cases_no_blocks <- true;
 		| ReserveNames names ->
@@ -101,6 +109,7 @@ type scope = {
 type rename_context = {
 	rc_hoisting : bool;
 	rc_no_shadowing : bool;
+	rc_no_catch_var_shadowing : bool;
 	rc_switch_cases_no_blocks : bool;
 	rc_scope : var_scope;
 	mutable rc_reserved : bool StringMap.t;
@@ -167,7 +176,7 @@ let rec use_var rc scope v =
 				scope.foreign_vars <- IntMap.add v.v_id v scope.foreign_vars;
 			(match scope.parent with
 			| Some parent -> use_var rc parent v
-			| None -> assert false
+			| None -> raise (Failure "Failed to locate variable declaration")
 			)
 		| (d, _) :: _ when d == v -> ()
 		| (d, overlaps) :: rest ->
@@ -184,7 +193,7 @@ let collect_loop scope fn =
 	fn();
 	scope.loop_count <- scope.loop_count - 1;
 	if scope.loop_count < 0 then
-		assert false;
+		raise (Failure "Unexpected loop count");
 	if scope.loop_count = 0 then
 		scope.loop_vars := IntMap.empty
 
@@ -194,11 +203,11 @@ let collect_loop scope fn =
 let rec collect_vars ?(in_block=false) rc scope e =
 	let collect_vars =
 		match e.eexpr with
-		| TBlock _ -> collect_vars ~in_block:true rc
+		| TBlock _ | TFunction _ -> collect_vars ~in_block:true rc
 		| _ -> collect_vars ~in_block:false rc
 	in
 	match e.eexpr with
-	| TVar (v, e_opt) when rc.rc_hoisting ->
+	| TVar (v, e_opt) when rc.rc_hoisting || (match e_opt with Some { eexpr = TFunction _ } -> true | _ -> false) ->
 		declare_var rc scope v;
 		Option.may (collect_vars scope) e_opt
 	| TVar (v, e_opt) ->
@@ -210,12 +219,21 @@ let rec collect_vars ?(in_block=false) rc scope e =
 		let scope = create_scope (Some scope) in
 		List.iter (fun (v,_) -> declare_var rc scope v) fn.tf_args;
 		List.iter (fun (v,_) -> use_var rc scope v) fn.tf_args;
-		collect_vars scope fn.tf_expr
+		(match fn.tf_expr.eexpr with
+		| TBlock exprs -> List.iter (collect_vars scope) exprs
+		| _ -> collect_vars scope fn.tf_expr
+		)
 	| TTry (try_expr, catches) ->
 		collect_vars scope try_expr;
 		List.iter (fun (v, catch_expr) ->
-			declare_var rc scope v;
-			collect_vars scope catch_expr
+			let v_expr = mk (TVar (v,None)) t_dynamic v.v_pos in
+			let e =
+				match catch_expr.eexpr with
+				| TBlock exprs -> { catch_expr with eexpr = TBlock (v_expr :: exprs) }
+				| _ -> { catch_expr with eexpr = TBlock [v_expr; catch_expr] }
+			in
+			collect_vars scope e;
+			if rc.rc_no_catch_var_shadowing then use_var rc scope v;
 		) catches
 	| TSwitch (target, cases, default_opt) when rc.rc_switch_cases_no_blocks ->
 		collect_vars scope target;
@@ -278,7 +296,7 @@ let maybe_rename_var rc reserved (v,overlaps) =
 		name := v.v_name ^ (string_of_int !count);
 	done;
 	v.v_name <- !name;
-	if rc.rc_no_shadowing || (v.v_capture && rc.rc_hoisting) then reserve reserved v.v_name
+	if rc.rc_no_shadowing || (has_var_flag v VCaptured && rc.rc_hoisting) then reserve reserved v.v_name
 
 (**
 	Rename variables found in `scope`
@@ -294,18 +312,23 @@ let rec rename_vars rc scope =
 	Rename local variables in `e` expression if needed.
 *)
 let run ctx ri e =
-	let rc = {
-		rc_scope = ri.ri_scope;
-		rc_hoisting = ri.ri_hoisting;
-		rc_no_shadowing = ri.ri_no_shadowing;
-		rc_switch_cases_no_blocks = ri.ri_switch_cases_no_blocks;
-		rc_reserved = ri.ri_reserved;
-	} in
-	if ri.ri_reserve_current_top_level_symbol then begin
-		match ctx.curclass.cl_path with
-		| s :: _,_ | [],s -> reserve_ctx rc s
-	end;
-	let scope = create_scope None in
-	collect_vars rc scope e;
-	rename_vars rc scope;
+	(try
+		let rc = {
+			rc_scope = ri.ri_scope;
+			rc_hoisting = ri.ri_hoisting;
+			rc_no_shadowing = ri.ri_no_shadowing;
+			rc_no_catch_var_shadowing = ri.ri_no_catch_var_shadowing;
+			rc_switch_cases_no_blocks = ri.ri_switch_cases_no_blocks;
+			rc_reserved = ri.ri_reserved;
+		} in
+		if ri.ri_reserve_current_top_level_symbol then begin
+			match ctx.curclass.cl_path with
+			| s :: _,_ | [],s -> reserve_ctx rc s
+		end;
+		let scope = create_scope None in
+		collect_vars rc scope e;
+		rename_vars rc scope;
+	with Failure msg ->
+		die ~p:e.epos msg __LOC__
+	);
 	e

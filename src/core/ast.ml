@@ -16,7 +16,7 @@
 	along with this program; if not, write to the Free Software
 	Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  *)
-
+open Extlib_leftovers
 open Globals
 
 type keyword =
@@ -205,20 +205,21 @@ and expr_def =
 	| ECall of expr * expr list
 	| ENew of placed_type_path * expr list
 	| EUnop of unop * unop_flag * expr
-	| EVars of (placed_name * bool * type_hint option * expr option) list
+	| EVars of evar list
 	| EFunction of function_kind * func
 	| EBlock of expr list
 	| EFor of expr * expr
 	| EIf of expr * expr * expr option
 	| EWhile of expr * expr * while_flag
 	| ESwitch of expr * (expr list * expr option * expr option * pos) list * (expr option * pos) option
-	| ETry of expr * (placed_name * type_hint * expr * pos) list
+	| ETry of expr * (placed_name * type_hint option * expr * pos) list
 	| EReturn of expr option
 	| EBreak
 	| EContinue
 	| EUntyped of expr
 	| EThrow of expr
 	| ECast of expr * type_hint option
+	| EIs of expr * type_hint
 	| EDisplay of expr * display_kind
 	| EDisplayNew of placed_type_path
 	| ETernary of expr * expr * expr
@@ -234,9 +235,44 @@ and type_param = {
 	tp_meta : metadata;
 }
 
+(**
+	This structure represents a documentation comment of a symbol.
+
+	Use `Ast.get_doc_text` to generate a final user-readable text for a doc_block.
+*)
 and doc_block = {
+	(** Contains own docs written nearby the symbol in Haxe code *)
 	doc_own: string option;
-	mutable doc_inherited: (unit -> (string option)) list
+	(**
+		This field is for docs pointed by @:inheritDoc meta.
+
+		It's populated with `InheritDoc.build_*` functions.
+		Each string in this list is compiled of a doc a single @:inheritDoc points to.
+
+		E.g. calling `InheritDoc.build_class_field_doc` for `field4` (from sample below)
+		will produce `doc_inherited = ["Own field3 doc"; "Own field2 doc\nOwn field1 doc"]`.
+
+		Sample:
+		```
+		class MyClass {
+
+			/** Own field1 doc */
+			function field1();
+
+			/** Own field2 doc */
+			@:inheritDoc(MyClass.field1) function field2();
+
+			/** Own field3 doc */
+			function field2();
+
+			/** Own field4 doc */
+			@:inheritDoc(MyClass.field3)
+			@:inheritDoc(MyClass.field2)
+			function field4();
+		}
+		```
+	*)
+	mutable doc_inherited: string list;
 }
 
 and documentation = doc_block option
@@ -254,6 +290,8 @@ and access =
 	| AMacro
 	| AFinal
 	| AExtern
+	| AAbstract
+	| AOverload
 
 and placed_access = access * pos
 
@@ -271,6 +309,14 @@ and class_field = {
 	mutable cff_kind : class_field_kind;
 }
 
+and evar = {
+	ev_name : placed_name;
+	ev_final : bool;
+	ev_type : type_hint option;
+	ev_expr : expr option;
+	ev_meta : metadata;
+}
+
 type enum_flag =
 	| EPrivate
 	| EExtern
@@ -282,6 +328,7 @@ type class_flag =
 	| HExtends of placed_type_path
 	| HImplements of placed_type_path
 	| HFinal
+	| HAbstract
 
 type abstract_flag =
 	| AbPrivate
@@ -289,6 +336,7 @@ type abstract_flag =
 	| AbTo of type_hint
 	| AbOver of type_hint
 	| AbExtern
+	| AbEnum
 
 type enum_constructor = {
 	ec_name : placed_name;
@@ -321,6 +369,7 @@ type type_def =
 	| EEnum of (enum_flag, enum_constructor list) definition
 	| ETypedef of (enum_flag, type_hint) definition
 	| EAbstract of (abstract_flag, class_field list) definition
+	| EStatic of (placed_access, class_field_kind) definition
 	| EImport of import
 	| EUsing of placed_name list
 
@@ -332,6 +381,15 @@ let mk_type_path ?(params=[]) ?sub (pack,name) =
 	if name = "" then
 		raise (Invalid_argument "Empty module name is not allowed");
 	{ tpackage = pack; tname = name; tsub = sub; tparams = params; }
+
+let mk_evar ?(final=false) ?(t:type_hint option) ?eo ?(meta=[]) name =
+	{
+		ev_name = name;
+		ev_final = final;
+		ev_type = t;
+		ev_expr = eo;
+		ev_meta = meta;
+	}
 
 let is_lower_ident i =
 	if String.length i = 0 then
@@ -351,9 +409,16 @@ let doc_from_string s = Some { doc_own = Some s; doc_inherited = []; }
 
 let doc_from_string_opt = Option.map (fun s -> { doc_own = Some s; doc_inherited = []; })
 
+(**
+	Generates full doc block text out of `doc_block` structure
+	by concatenating `d.doc_own` and all entries of `d.doc_inherited` with new lines
+	in between.
+*)
 let gen_doc_text d =
 	let docs =
-		match d.doc_own with Some s -> [s] | None -> []
+		match d.doc_own with
+		| Some s -> s :: d.doc_inherited
+		| None -> d.doc_inherited
 	in
 	String.concat "\n" docs
 
@@ -413,6 +478,8 @@ let s_access = function
 	| AMacro -> "macro"
 	| AFinal -> "final"
 	| AExtern -> "extern"
+	| AAbstract -> "abstract"
+	| AOverload -> "overload"
 
 let s_placed_access (a,_) = s_access a
 
@@ -665,10 +732,10 @@ let map_expr loop (e,p) =
 		ENew (t,el)
 	| EUnop (op,f,e) -> EUnop (op,f,loop e)
 	| EVars vl ->
-		EVars (List.map (fun (n,b,t,eo) ->
-			let t = opt type_hint t in
-			let eo = opt loop eo in
-			n,b,t,eo
+		EVars (List.map (fun v ->
+			let t = opt type_hint v.ev_type in
+			let eo = opt loop v.ev_expr in
+			{ v with ev_type = t; ev_expr = eo }
 		) vl)
 	| EFunction (kind,f) -> EFunction (kind,func f)
 	| EBlock el -> EBlock (List.map loop el)
@@ -697,7 +764,7 @@ let map_expr loop (e,p) =
 		ESwitch (e, cases, def)
 	| ETry (e,catches) ->
 		let e = loop e in
-		let catches = List.map (fun (n,t,e,p) -> n,type_hint t,loop e,p) catches in
+		let catches = List.map (fun (n,t,e,p) -> n,Option.map type_hint t,loop e,p) catches in
 		ETry (e,catches)
 	| EReturn e -> EReturn (opt loop e)
 	| EBreak -> EBreak
@@ -708,6 +775,10 @@ let map_expr loop (e,p) =
 		let e = loop e in
 		let t = opt type_hint t in
 		ECast (e,t)
+	| EIs (e,t) ->
+		let e = loop e in
+		let t = type_hint t in
+		EIs (e,t)
 	| EDisplay (e,f) -> EDisplay (loop e,f)
 	| EDisplayNew t -> EDisplayNew (tpath t)
 	| ETernary (e1,e2,e3) ->
@@ -729,7 +800,7 @@ let iter_expr loop (e,p) =
 	match e with
 	| EConst _ | EContinue | EBreak | EDisplayNew _ | EReturn None -> ()
 	| EParenthesis e1 | EField(e1,_) | EUnop(_,_,e1) | EReturn(Some e1) | EThrow e1 | EMeta(_,e1)
-	| ECheckType(e1,_) | EDisplay(e1,_) | ECast(e1,_) | EUntyped e1 -> loop e1;
+	| ECheckType(e1,_) | EDisplay(e1,_) | ECast(e1,_) | EIs(e1,_) | EUntyped e1 -> loop e1;
 	| EArray(e1,e2) | EBinop(_,e1,e2) | EFor(e1,e2) | EWhile(e1,e2,_) | EIf(e1,e2,None) -> loop e1; loop e2;
 	| ETernary(e1,e2,e3) | EIf(e1,e2,Some e3) -> loop e1; loop e2; loop e3;
 	| EArrayDecl el | ENew(_,el) | EBlock el -> List.iter loop el
@@ -749,7 +820,7 @@ let iter_expr loop (e,p) =
 	| EFunction(_,f) ->
 		List.iter (fun (_,_,_,_,eo) -> opt eo) f.f_args;
 		opt f.f_expr
-	| EVars vl -> List.iter (fun (_,_,_,eo) -> opt eo) vl
+	| EVars vl -> List.iter (fun v -> opt v.ev_expr) vl
 
 let s_object_key_name name =  function
 	| DoubleQuotes -> "\"" ^ StringHelper.s_escape name ^ "\""
@@ -798,6 +869,7 @@ module Printer = struct
 		| EThrow e -> "throw " ^ s_expr_inner tabs e
 		| ECast (e,Some (t,_)) -> "cast (" ^ s_expr_inner tabs e ^ ", " ^ s_complex_type tabs t ^ ")"
 		| ECast (e,None) -> "cast " ^ s_expr_inner tabs e
+		| EIs (e,(t,_)) -> s_expr_inner tabs e ^ " is " ^ s_complex_type tabs t
 		| ETernary (e1,e2,e3) -> s_expr_inner tabs e1 ^ " ? " ^ s_expr_inner tabs e2 ^ " : " ^ s_expr_inner tabs e3
 		| ECheckType (e,(t,_)) -> "(" ^ s_expr_inner tabs e ^ " : " ^ s_complex_type tabs t ^ ")"
 		| EMeta (m,e) -> s_metadata tabs m ^ " " ^ s_expr_inner tabs e
@@ -884,14 +956,17 @@ module Printer = struct
 		if List.length tl > 0 then "<" ^ String.concat ", " (List.map (s_type_param tabs) tl) ^ ">" else ""
 	and s_func_arg tabs ((n,_),o,_,t,e) =
 		if o then "?" else "" ^ n ^ s_opt_type_hint tabs t ":" ^ s_opt_expr tabs e " = "
-	and s_var tabs ((n,_),_,t,e) =
-		n ^ (s_opt_type_hint tabs t ":") ^ s_opt_expr tabs e " = "
+	and s_var tabs v =
+		let s = (fst v.ev_name) ^ (s_opt_type_hint tabs v.ev_type ":") ^ s_opt_expr tabs v.ev_expr " = " in
+		if v.ev_meta = [] then s
+		else (String.concat " " (List.map (s_metadata tabs) v.ev_meta)) ^ " " ^ s
 	and s_case tabs (el,e1,e2,_) =
 		"case " ^ s_expr_list tabs el ", " ^
 		(match e1 with None -> ":" | Some e -> " if (" ^ s_expr_inner tabs e ^ "):") ^
 		(match e2 with None -> "" | Some e -> s_expr_omit_block tabs e)
-	and s_catch tabs ((n,_),(t,_),e,_) =
-		" catch(" ^ n ^ ":" ^ s_complex_type tabs t ^ ") " ^ s_expr_inner tabs e
+	and s_catch tabs ((n,_),t,e,_) =
+		let hint = Option.map_default (fun (t,_) -> ":" ^ s_complex_type tabs t) "" t in
+		" catch(" ^ n ^ hint ^ ") " ^ s_expr_inner tabs e
 	and s_block tabs el opn nl cls =
 		 opn ^ "\n\t" ^ tabs ^ (s_expr_list (tabs ^ "\t") el (";\n\t" ^ tabs)) ^ ";" ^ nl ^ tabs ^ cls
 	and s_expr_omit_block tabs e =
@@ -1030,9 +1105,14 @@ module Expr = struct
 				loop e1
 			| EVars vl ->
 				add "EVars";
-				List.iter (fun ((n,p),_,cto,eo) ->
-					add (Printf.sprintf "%s  %s%s" tabs n (match cto with None -> "" | Some (ct,_) -> ":" ^ Printer.s_complex_type "" ct));
-					match eo with
+				List.iter (fun v ->
+					let t_hint =
+						match v.ev_type with
+						| None -> ""
+						| Some (ct,_) -> ":" ^ Printer.s_complex_type "" ct
+					in
+					add (Printf.sprintf "%s  %s%s" tabs (fst v.ev_name) t_hint);
+					match v.ev_expr with
 					| None -> ()
 					| Some e ->
 						loop' (Printf.sprintf "%s      " tabs) e
@@ -1086,6 +1166,9 @@ module Expr = struct
 			| ECast(e1,_) ->
 				add "ECast";
 				loop e1;
+			| EIs(e1,_) ->
+				add "EIs";
+				loop e1;
 			| EDisplay(e1,dk) ->
 				add ("EDisplay " ^ (s_display_kind dk));
 				loop e1
@@ -1101,10 +1184,24 @@ module Expr = struct
 				add ("EMeta " ^ fst (Meta.get_info m));
 				loop e1
 			| EDisplayNew _ ->
-				assert false
+				die "" __LOC__
 		in
 		loop' "" e;
 		Buffer.contents buf
+
+	let find_ident e =
+		let rec loop e = match fst e with
+			| EConst ct ->
+				begin match ct with
+				| Ident s ->
+					Some s
+				| _ ->
+					None
+				end
+			| _ ->
+				None
+		in
+		loop e
 end
 
 let has_meta_option metas meta s =
